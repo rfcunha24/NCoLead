@@ -191,7 +191,6 @@
     </div>
     <nav class="tabs">
       <button class="tab on" data-view="board">Board</button>
-      <button class="tab" data-view="chat">Chat</button>
       <button class="tab" data-view="scorer">Scorer</button>
       <button class="tab" data-view="add">Add lead</button>
       <button class="tab" data-view="import">Import</button>
@@ -222,17 +221,6 @@
       <button class="btn" id="xlsxBtn">Export Excel</button>
     </div>
     <div class="tablewrap" id="tablewrap"></div>
-  </section>
-
-  <section class="view" id="chat">
-    <div class="chatwrap">
-      <div class="chatmsgs" id="chatMsgs"></div>
-      <div class="chatbusy" id="chatBusy" style="display:none">Claude is researching…</div>
-      <div class="chatform">
-        <textarea id="chatInput" placeholder="Ask Claude to find leads (e.g. &quot;Find 5 Dutch garden &amp; pet wholesalers in the GS1 datapool&quot;) or paste a company to discuss…"></textarea>
-        <button class="btn primary" id="chatSend">Send</button>
-      </div>
-    </div>
   </section>
 
   <section class="view" id="scorer">
@@ -602,6 +590,7 @@ function openDrawer(i,mode){
       <div class="drawer-head">
         <div><h2>${esc(l.company)}</h2><div class="dsub">${esc(l.country||'')} · ${esc(l.type||'')} · ${l.reject?'rejected':scoreOf(l)+'/10'} · Tier ${t}</div></div>
         <div style="display:flex;gap:8px;flex-shrink:0">
+          <button class="btn ghost" onclick="discussCurrentLead()">Discuss</button>
           <button class="btn ghost" onclick="reopenDrawer('edit')">Edit</button>
           <button class="x" onclick="closeDrawer()">✕</button>
         </div>
@@ -751,45 +740,132 @@ document.getElementById('addBtn').onclick=()=>{
 };
 document.getElementById('addResetBtn').onclick=resetAddForm;
 
-/* ---------- chat (lead agent) ---------- */
+/* ---------- chat (floating lead agent) ---------- */
 const FUNCTIONS_URL = SUPABASE_URL ? SUPABASE_URL.replace(/\/+$/,'') + '/functions/v1/lead-agent' : '';
-let chatHistory=[];
+let chatThreads={};        // keyed by 'general' or 'lead:<id>' so each topic keeps its own history
+let chatKey='general';
+let chatContextLead=null;
 let chatBusy=false;
+
+(function injectChatUI(){
+  const css=document.createElement('style');
+  css.textContent=`
+    .fab{position:fixed;right:22px;bottom:22px;width:56px;height:56px;border-radius:50%;background:var(--accent);color:#fff;border:0;cursor:pointer;box-shadow:0 8px 24px rgba(34,42,48,.28);display:flex;align-items:center;justify-content:center;z-index:45;transition:transform .15s,background .15s}
+    .fab:hover{transform:scale(1.06);background:#356180}
+    .fab svg{width:24px;height:24px}
+    .chatpop{position:fixed;right:22px;bottom:90px;width:min(400px,calc(100vw - 32px));height:min(560px,calc(100vh - 140px));background:var(--paper);border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 50px rgba(34,42,48,.28);display:flex;flex-direction:column;overflow:hidden;z-index:46;opacity:0;transform:translateY(12px) scale(.98);pointer-events:none;transition:.18s}
+    .chatpop.on{opacity:1;transform:none;pointer-events:auto}
+    .chatpop-head{background:var(--ink);color:#f4f3ef;padding:13px 16px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+    .chatpop-head b{font-family:'Space Grotesk',sans-serif;font-size:14px;display:block}
+    .chatpop-head .sub{font-size:11px;color:#9aa6b0;font-family:'JetBrains Mono',monospace;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:250px}
+    .chatpop-head .hbtns{display:flex;gap:6px;flex-shrink:0}
+    .chatpop-head button{background:rgba(255,255,255,.12);border:0;color:#fff;width:26px;height:26px;border-radius:7px;cursor:pointer;font-size:14px;line-height:1}
+    .chatpop-head button:hover{background:rgba(255,255,255,.22)}
+  `;
+  document.head.appendChild(css);
+
+  const fab=document.createElement('button');
+  fab.className='fab';fab.id='chatFab';fab.title='Chat with Claude';
+  fab.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>';
+  document.body.appendChild(fab);
+
+  const pop=document.createElement('div');
+  pop.className='chatpop';pop.id='chatPop';
+  pop.innerHTML=`
+    <div class="chatpop-head">
+      <div style="min-width:0"><b id="chatTitle">Lead research</b><div class="sub" id="chatSubtitle">Find new prospects</div></div>
+      <div class="hbtns">
+        <button id="chatGeneral" title="Switch to general research">&#43;</button>
+        <button id="chatClose" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="chatmsgs" id="chatMsgs"></div>
+    <div class="chatbusy" id="chatBusy" style="display:none">Claude is researching&hellip;</div>
+    <div class="chatform">
+      <textarea id="chatInput" placeholder="Message Claude&hellip;"></textarea>
+      <button class="btn primary" id="chatSend">Send</button>
+    </div>`;
+  document.body.appendChild(pop);
+
+  fab.onclick=()=>{ const p=document.getElementById('chatPop'); if(p.classList.contains('on')) closeChat(); else openChat(chatContextLead); };
+  document.getElementById('chatClose').onclick=closeChat;
+  document.getElementById('chatGeneral').onclick=()=>openChat(null);
+  document.getElementById('chatSend').onclick=sendChat;
+  document.getElementById('chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();}});
+})();
+
+function curHistory(){ return chatThreads[chatKey] || (chatThreads[chatKey]=[]); }
+function leadSnapshot(l){
+  return {company:l.company,country:l.country,sector:l.sector,type:l.type,source:l.source,website:l.website,
+    employees:l.employees,revenue:l.revenue,tools:l.tools,switch:l.switch,product:l.product,personas:l.personas,
+    why:l.why,pains:l.pains,notes:l.notes,status:statusOf(l),signals:l.signals||[],reject:!!l.reject,
+    score:scoreOf(l),tier:tierOf(l)};
+}
+function openChat(lead){
+  if(lead){ chatContextLead=lead; chatKey='lead:'+(lead.id||lead.company); }
+  else { chatContextLead=null; chatKey='general'; }
+  const title=document.getElementById('chatTitle');
+  const sub=document.getElementById('chatSubtitle');
+  const inp=document.getElementById('chatInput');
+  if(lead){
+    title.textContent='Discuss: '+(lead.company||'lead');
+    sub.textContent=[lead.country,lead.sector].filter(Boolean).join(' \u00b7 ')||'This lead only';
+    if(inp)inp.placeholder='Ask about '+(lead.company||'this lead')+'\u2026';
+  } else {
+    title.textContent='Lead research';
+    sub.textContent='Find new prospects';
+    if(inp)inp.placeholder='Find leads, e.g. "5 Belgian home & garden importers"\u2026';
+  }
+  renderChat();
+  document.getElementById('chatPop').classList.add('on');
+  setTimeout(()=>{const i=document.getElementById('chatInput');if(i)i.focus();},60);
+}
+function closeChat(){ document.getElementById('chatPop').classList.remove('on'); }
+function discussCurrentLead(){ const i=curDrawerIndex(); if(i<0)return; const l=LEADS[i]; closeDrawer(); openChat(l); }
+function setChatBusy(b){chatBusy=b;document.getElementById('chatBusy').style.display=b?'':'none';document.getElementById('chatSend').disabled=b;}
 function renderChat(){
-  const box=document.getElementById('chatMsgs');
-  if(chatHistory.length===0){
-    box.innerHTML=`<div class="chatempty"><h3>Research leads with Claude</h3><p>Ask for new prospects or paste a company to discuss. Anything Claude qualifies is saved to the board and shows up for the whole team automatically. Your old Claude-project + JSON import still works too.</p></div>`;
+  const box=document.getElementById('chatMsgs'); if(!box)return;
+  const hist=curHistory();
+  if(hist.length===0){
+    box.innerHTML=chatContextLead
+      ? `<div class="chatempty"><h3>Discussing ${esc(chatContextLead.company||'this lead')}</h3><p>Ask about this company only &mdash; fit, qualification, talking points, or to revise its assessment. Claude won't add other companies in this thread.</p></div>`
+      : `<div class="chatempty"><h3>Research leads with Claude</h3><p>Ask for new prospects (e.g. "Find 5 Dutch garden &amp; pet wholesalers in the GS1 datapool"). Anything Claude qualifies is saved to the board for the whole team.</p></div>`;
     return;
   }
-  box.innerHTML=chatHistory.map(m=>{
+  box.innerHTML=hist.map(m=>{
     if(m.role==='note')return `<div class="bubble note${m.err?' err':''}">${esc(m.content)}</div>`;
     return `<div class="bubble ${m.role==='user'?'user':'ai'}">${esc(m.content)}</div>`;
   }).join('');
   box.scrollTop=box.scrollHeight;
 }
-function setChatBusy(b){chatBusy=b;document.getElementById('chatBusy').style.display=b?'':'none';document.getElementById('chatSend').disabled=b;}
 async function sendChat(){
   if(chatBusy)return;
   const input=document.getElementById('chatInput');
   const text=input.value.trim();if(!text)return;
-  if(!cloud||!FUNCTIONS_URL){chatHistory.push({role:'note',err:true,content:'Chat needs the cloud backend — sign in on the deployed site to use it.'});renderChat();return;}
-  chatHistory.push({role:'user',content:text});input.value='';renderChat();setChatBusy(true);
+  const hist=curHistory();
+  if(!cloud||!FUNCTIONS_URL){hist.push({role:'note',err:true,content:'Chat needs the cloud backend — sign in on the deployed site to use it.'});renderChat();return;}
+  hist.push({role:'user',content:text});input.value='';renderChat();setChatBusy(true);
   try{
     const {data:{session}}=await sb.auth.getSession();
-    const payload=chatHistory.filter(m=>m.role==='user'||m.role==='assistant').map(m=>({role:m.role,content:m.content}));
+    const base=hist.filter(m=>m.role==='user'||m.role==='assistant').map(m=>({role:m.role,content:m.content}));
+    let payload=base;
+    if(chatContextLead){
+      const L=chatContextLead;
+      const ctx='We are discussing ONLY this existing lead from the board. Do not search for or add any other companies in this conversation. '
+        +'If we decide to revise its assessment, use save_leads for just this same company so its existing board row is updated. '
+        +'Here is its current data:\n'+JSON.stringify(leadSnapshot(L),null,2);
+      payload=[{role:'user',content:ctx},{role:'assistant',content:'Understood — I will focus only on '+(L.company||'this lead')+' and will not add other companies.'},...base];
+    }
     const res=await fetch(FUNCTIONS_URL,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${session.access_token}`},body:JSON.stringify({messages:payload})});
     const out=await res.json().catch(()=>({}));
-    if(!res.ok){chatHistory.push({role:'note',err:true,content:'⚠️ '+(out.error||('Error '+res.status))+(out.detail?(' — '+String(out.detail).slice(0,200)):'')});}
+    if(!res.ok){hist.push({role:'note',err:true,content:'⚠️ '+(out.error||('Error '+res.status))+(out.detail?(' — '+String(out.detail).slice(0,200)):'')});}
     else{
-      chatHistory.push({role:'assistant',content:out.reply||'(no reply)'});
-      if(out.saved>0)chatHistory.push({role:'note',content:`✓ Added ${out.saved} lead${out.saved>1?'s':''} to the board`});
+      hist.push({role:'assistant',content:out.reply||'(no reply)'});
+      if(out.saved>0)hist.push({role:'note',content:`✓ ${chatContextLead?'Updated':'Added'} ${out.saved} lead${out.saved>1?'s':''} on the board`});
     }
-  }catch(e){chatHistory.push({role:'note',err:true,content:'⚠️ Network error: '+e.message});}
+  }catch(e){hist.push({role:'note',err:true,content:'⚠️ Network error: '+e.message});}
   setChatBusy(false);renderChat();
 }
-document.getElementById('chatSend').onclick=sendChat;
-document.getElementById('chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();}});
-renderChat();
 
 /* ---------- tabs + filters ---------- */
 ['q','fTier','fStatus','fCountry','fSource'].forEach(id=>document.getElementById(id).addEventListener('input',renderTable));
